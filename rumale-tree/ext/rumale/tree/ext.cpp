@@ -36,4 +36,6 @@ extern "C" void Init_ext(void) {
   ExtDecisionTreeClassifier::define_module(rb_mTree);
   ExtDecisionTreeRegressor::define_module(rb_mTree);
   ExtGradientTreeRegressor::define_module(rb_mTree);
+  ExtBaseObliviousDecisionTree::define_module(rb_mTree);
+  ExtObliviousDecisionTreeClassifier::define_module(rb_mTree);
 }

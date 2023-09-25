@@ -31,6 +31,7 @@
 #ifndef RUMALE_TREE_EXT_HPP
 #define RUMALE_TREE_EXT_HPP 1
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <string>
@@ -544,6 +545,138 @@ private:
     FindSplitParamsOpts_ opts = { NUM2DBL(sum_gradient), NUM2DBL(sum_hessian), NUM2DBL(reg_lambda) };
     VALUE params = na_ndloop3(&ndf, &opts, 4, order, features, gradients, hessians);
     return params;
+  }
+};
+
+class ExtBaseObliviousDecisionTree {
+public:
+  static void define_module(VALUE& outer) {
+    VALUE rb_mExtBaseODTree = rb_define_module_under(outer, "ExtBaseObliviousDecisionTree");
+    rb_define_private_method(rb_mExtBaseODTree, "sort_uniq", sort_uniq_, 1);
+  }
+
+private:
+  static void iter_sort_uniq_(na_loop_t const* lp) {
+    const double* x = (double*)NDL_PTR(lp, 0);
+    const size_t n_elements = NDL_SHAPE(lp, 0)[0];
+    std::vector<double> v(x, x + n_elements);
+    std::sort(v.begin(), v.end());
+    std::vector<double>::iterator it = std::unique(v.begin(), v.end());
+    v.erase(it, v.end());
+    VALUE* ret = (VALUE*)NDL_PTR(lp, 1);
+    *ret = rb_ary_new2(v.size());
+    for (size_t i = 0; i < v.size(); i++) {
+      rb_ary_store(*ret, i, DBL2NUM(v[i]));
+    }
+  }
+
+  static VALUE sort_uniq_(VALUE self, VALUE x) {
+    ndfunc_arg_in_t ain[1] = { { numo_cDFloat, 1 } };
+    ndfunc_arg_out_t aout[1] = { { numo_cRObject, 0 } };
+    ndfunc_t ndf = { (na_iter_func_t)iter_sort_uniq_, NO_LOOP | NDF_EXTRACT, 1, 1, ain, aout };
+    VALUE ux = na_ndloop(&ndf, 1, x);
+    return rb_funcall(rb_obj_class(x), rb_intern("cast"), 1, ux);
+  }
+};
+
+class ExtObliviousDecisionTreeClassifier {
+public:
+  static void define_module(VALUE& outer) {
+    VALUE rb_mExtODTreeCls = rb_define_module_under(outer, "ExtObliviousDecisionTreeClassifier");
+    rb_define_private_method(rb_mExtODTreeCls, "find_threshold", find_threshold_, 6);
+  }
+
+private:
+  static double calc_impurity_(const std::string& criterion, const std::vector<size_t>& histogram, const size_t& n_elements, const size_t& n_classes) {
+    double impurity = 0.0;
+    if (criterion == "entropy") {
+      double entropy = 0.0;
+      for (size_t i = 0; i < n_classes; i++) {
+        const double el = static_cast<double>(histogram[i]) / static_cast<double>(n_elements);
+        entropy += el * std::log(el + 1.0);
+      }
+      impurity = -entropy;
+    } else {
+      double gini = 0.0;
+      for (size_t i = 0; i < n_classes; i++) {
+        const double el = static_cast<double>(histogram[i]) / static_cast<double>(n_elements);
+        gini += el * el;
+      }
+      impurity = 1.0 - gini;
+    }
+    return impurity;
+  }
+
+  /** */
+
+  struct FindThresholdOpts_ {
+    VALUE subsets;
+    std::string criterion;
+    size_t n_classes;
+  };
+
+  static void iter_find_threshold_(na_loop_t const* lp) {
+    const double* candidates = (double*)NDL_PTR(lp, 0);
+    const size_t n_candidates = NDL_SHAPE(lp, 0)[0];
+    const double* x = (double*)NDL_PTR(lp, 1);
+    const int32_t* y = (int32_t*)NDL_PTR(lp, 2);
+    const size_t n_elements = NDL_SHAPE(lp, 1)[0];
+    const VALUE subsets = ((FindThresholdOpts_*)lp->opt_ptr)->subsets;
+    const size_t n_subsets = RARRAY_LEN(subsets);
+    const std::string criterion = ((FindThresholdOpts_*)lp->opt_ptr)->criterion;
+    const size_t n_classes = ((FindThresholdOpts_*)lp->opt_ptr)->n_classes;
+
+    //
+    double max_gain = std::numeric_limits<double>::lowest();
+    double best_threshold = 0.0;
+    for (size_t i = 0; i < n_candidates; i++) {
+      const double threshold = candidates[i];
+      double sum_gain = 0.0;
+      for (size_t j = 0; j < n_subsets; j++) {
+        VALUE subset = rb_ary_entry(subsets, j);
+        VALUE indices = rb_funcall(subset, rb_intern("indices"), 0);
+        const size_t n_subset_elements = RARRAY_LEN(indices);
+        size_t n_l_elements = 0;
+        size_t n_r_elements = 0;
+        std::vector<size_t> histogram(n_classes, 0);
+        std::vector<size_t> l_histogram(n_classes, 0);
+        std::vector<size_t> r_histogram(n_classes, 0);
+        for (size_t k = 0; k < n_subset_elements; k++) {
+          const size_t idx = NUM2SIZET(rb_ary_entry(indices, k));
+          histogram[y[idx]] += 1;
+          if (x[idx] < threshold) {
+            l_histogram[y[idx]] += 1;
+            n_l_elements++;
+          } else {
+            r_histogram[y[idx]] += 1;
+            n_r_elements++;
+          }
+        }
+        const double impurity = calc_impurity_(criterion, histogram, n_subset_elements, n_classes);
+        const double l_impurity = calc_impurity_(criterion, l_histogram, n_l_elements, n_classes);
+        const double r_impurity = calc_impurity_(criterion, r_histogram, n_r_elements, n_classes);
+        const double gain = impurity - (n_l_elements * l_impurity + n_r_elements * r_impurity) / static_cast<double>(n_subset_elements);
+        sum_gain += (static_cast<double>(n_subset_elements) / static_cast<double>(n_elements)) * gain;
+      }
+      if (sum_gain > max_gain) {
+        max_gain = sum_gain;
+        best_threshold = threshold;
+      }
+    }
+    double* ret = (double*)NDL_PTR(lp, 3);
+    ret[0] = best_threshold;
+    ret[1] = max_gain;
+  }
+
+  static VALUE find_threshold_(VALUE self, VALUE candidates, VALUE x, VALUE y, VALUE subsets, VALUE criterion, VALUE n_classes) {
+    ndfunc_arg_in_t ain[3] = { { numo_cDFloat, 1 }, { numo_cDFloat, 1 }, { numo_cInt32, 1 } };
+    size_t shape[1] = { 2 };
+    ndfunc_arg_out_t aout[1] = { { numo_cDFloat, 1, shape } };
+    FindThresholdOpts_ opts = { subsets, std::string(StringValueCStr(criterion)), NUM2SIZET(n_classes) };
+    ndfunc_t ndf = { (na_iter_func_t)iter_find_threshold_, NO_LOOP, 3, 1, ain, aout };
+    VALUE ret = na_ndloop3(&ndf, &opts, 3, candidates, x, y);
+    RB_GC_GUARD(criterion);
+    return ret;
   }
 };
 
